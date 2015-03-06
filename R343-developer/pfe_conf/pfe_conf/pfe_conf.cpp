@@ -318,6 +318,8 @@ void printDebugInfo()
     DISPLAY_DEVICEA  displayDevice;
     DEVMODEA         devmode;
 
+    ulog("\nDEBUG:");
+
     // initialize displayDevice
     ZeroMemory(&displayDevice, sizeof(displayDevice));
     displayDevice.cb = sizeof(displayDevice);
@@ -380,6 +382,7 @@ void printDebugInfo()
             }
         }
 
+        if(0)
         {
         	UINT32 mode_idx = 0;
         	DEVMODEA mode_info = {0};
@@ -411,6 +414,8 @@ void detachNonNvdiaDisplays()
     DISPLAY_DEVICEA  displayDevice;
     DEVMODEA         devmode;
     DWORD dwRet = DISP_CHANGE_FAILED;
+
+	ulog("NVIDIA display attached, detach other displays...\n");
 
     // initialize displayDevice
     ZeroMemory(&displayDevice, sizeof(displayDevice));
@@ -488,191 +493,187 @@ void detachNonNvdiaDisplays()
     }
 }
 
+NvU32 showAllDisplays()
+{
+    ulog("Attached NVIDIA displays:");
+    NvU32 numAttached = 0;
+    NvDisplayHandle display_handle;
+    while (NvAPI_EnumNvidiaDisplayHandle(numAttached, &display_handle) == NVAPI_OK)
+    {
+        NvAPI_ShortString display_name;
+        if (NvAPI_GetAssociatedNvidiaDisplayName(display_handle, display_name) == NVAPI_OK)
+        {
+            NvU32 display_output_id;
+            if (NvAPI_GetAssociatedDisplayOutputId(display_handle, &display_output_id) == NVAPI_OK)
+            {
+                ulog("\tdisplay[%s], output ID[0x%08x]", display_name, display_output_id);
+            }
+            else
+            {
+                ulog("Failed to get display output ID for attached display[%s]", display_name);
+            }
+        }
+        else
+        {
+            ulog("Failed to get display name for attached display device %d", numAttached);
+        }
+
+        numAttached++;
+    }
+
+    ulog("Detached NVIDIA displays:");
+    NvU32 numUnattached = 0;
+    NvUnAttachedDisplayHandle unattached_display_handle;
+    while (NvAPI_EnumNvidiaUnAttachedDisplayHandle(numUnattached, &unattached_display_handle) == NVAPI_OK)
+    {
+        NvAPI_ShortString display_name;
+        if(NvAPI_GetUnAttachedAssociatedDisplayName(unattached_display_handle, display_name) == NVAPI_OK)
+        {
+            ulog("\tdisplay[%s]", display_name);
+        }
+        else
+        {
+            ulog("Failed to get display name for unattached display device %d", numUnattached);
+        }
+
+        numUnattached++;
+    }
+
+    return numAttached;
+}
+
+int load()
+{
+    NvAPI_Status ret = NVAPI_OK;
+    ret = NvAPI_Initialize();
+    if (ret == NVAPI_LIBRARY_NOT_FOUND)
+    {
+        ulog("NVIDIA driver not found.");
+        pfe_pause();
+        return 1;
+    }
+
+    if (ret != NVAPI_OK)
+    {
+        ulog("NvAPI Initialize() failed = 0x%x", ret);
+        pfe_pause();
+        return 1;
+    }
+
+    NvAPI_ShortString interfaceVersion;
+    ret = NvAPI_GetInterfaceVersionString(interfaceVersion);
+    if(ret != NVAPI_OK)
+    {
+        ulog("Failed to get NvAPI interface version = 0x%x", ret);
+    }
+    else
+    {
+        ulog("NvAPI initialized, interface version = %s", interfaceVersion);   
+    }
+
+    return 0;
+}
+
+void getGPUDisplays()
+{
+    NvAPI_Status nvStatus;
+    NvPhysicalGpuHandle nvGPUHandles[NVAPI_MAX_PHYSICAL_GPUS];
+    memset(nvGPUHandles, 0, sizeof(NvPhysicalGpuHandle));
+    NvU32 nvGpuCount = 0;
+    if ((NvAPI_EnumPhysicalGPUs(nvGPUHandles, &nvGpuCount) == NVAPI_OK) && nvGpuCount > 0) 
+    {
+        // we got some NVIDIA GPUs...
+        NV_EDID anEdidNv;
+        memset(&anEdidNv, 0, sizeof(NV_EDID));
+        anEdidNv.version = NV_EDID_VER;
+
+        for (size_t h = 0; h < nvGpuCount; h++) 
+        {
+            NvU32 displayCnt = 0;
+            nvStatus = NvAPI_GPU_GetAllDisplayIds(nvGPUHandles[h], NULL, &displayCnt);
+            if (nvStatus == NVAPI_OK)
+            {
+                ulog("%u displays for GPU %u:", displayCnt, h);
+
+                NV_GPU_DISPLAYIDS* pDisplayIds = NULL;
+
+                pDisplayIds = (NV_GPU_DISPLAYIDS*)malloc(displayCnt * sizeof(NV_GPU_DISPLAYIDS));
+                memset(pDisplayIds, 0, displayCnt * sizeof(NV_GPU_DISPLAYIDS));
+
+                for (unsigned int i = 0; i < displayCnt; ++i)
+                {
+                    pDisplayIds[i].version = NV_GPU_DISPLAYIDS_VER;
+                }
+
+                nvStatus = NvAPI_GPU_GetAllDisplayIds(nvGPUHandles[h], pDisplayIds, &displayCnt);
+                if(nvStatus == NVAPI_OK)
+                {
+                    for (unsigned int i = 0; i < displayCnt; ++i)
+                    {
+                        ulog("GPU[%u] display[0x%x]: OSVisible[%s], connected[%s], active[%s]", 
+                                h, pDisplayIds[i].displayId, pDisplayIds[i].isOSVisible?"YES":"NO", pDisplayIds[i].isConnected?"YES":"NO", pDisplayIds[i].isActive?"YES":"NO");
+
+                        nvStatus = NvAPI_GPU_GetEDID(nvGPUHandles[h], pDisplayIds[i].displayId, &anEdidNv);
+                        if (nvStatus != NVAPI_OK)
+                        {
+                            ulog("Failed to get EDID for display 0x%x GPU %u", pDisplayIds[i].displayId, h);
+
+                            if (pDisplayIds[i].isOSVisible // visible to the OS
+                                && !pDisplayIds[i].isConnected // not connected i.e. no monitors are connected
+                                && !pDisplayIds[i].isActive) // not displaying anything
+                            {
+                                NV_EDID loadEdid;
+                                makeEdid(&loadEdid);
+                                nvStatus = NvAPI_GPU_SetEDID(nvGPUHandles[h], pDisplayIds[i].displayId, &loadEdid);
+                                if(nvStatus != NVAPI_OK)
+                                {
+                                    ulog("Failed to set EDID for display 0x%x GPU %u", pDisplayIds[i].displayId, h);
+                                }
+                                else
+                                {
+                                    ulog("Successfully set EDID for display 0x%x GPU %u", pDisplayIds[i].displayId, h);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            ulog("Got EDID (id = %u, version = 0x%x, size = %u, offset = %u) for display 0x%x (%sactive) GPU %u\n", 
+                                anEdidNv.edidId, anEdidNv.version, anEdidNv.sizeofEDID, anEdidNv.offset, pDisplayIds[i].displayId, pDisplayIds[i].isActive?"":"in", h);
+
+                            for(unsigned int j = 0; 0 && j < anEdidNv.sizeofEDID; j++)
+                            {
+                                printf("%.2x ", anEdidNv.EDID_Data[j]&0xff);
+                            }
+                        }
+                    }
+                }
+
+                free(pDisplayIds);
+            }
+            else
+            {
+                ulog("Failed to get number of displays for GPU %u", h);
+                continue;
+            }
+        }
+    }
+}
+
 int main1()
 {
-	NvAPI_Status ret = NVAPI_OK;
-	ret = NvAPI_Initialize();
-	if (ret != NVAPI_OK)
-	{
-		ulog("NvAPI_Initialize() failed = 0x%x", ret);
-		pfe_pause();
-		return 1; // Initialization failed
-	}
+	if(load() != 0)
+    {
+        pfe_pause();
+        return 1;
+    }
 
+	ulog("%u NVIDIA display attached!", showAllDisplays());
 
-	ulog("attached displays...\n");
-	NvU32 num = 0;
-	NvDisplayHandle display_handle;
-	while (NvAPI_EnumNvidiaDisplayHandle(num, &display_handle) == NVAPI_OK)
-	{
-		NvAPI_ShortString display_name;
-		if (NvAPI_GetAssociatedNvidiaDisplayName(display_handle, display_name) == NVAPI_OK)
-		{
-			ulog("display: %s\t", display_name);
-		}
-		else
-		{
-			ulog("Failed to get display name for attached display device %d", num);
-		}
+	getGPUDisplays();
 
-		NvU32 display_output_id;
-		if (NvAPI_GetAssociatedDisplayOutputId(display_handle, &display_output_id) == NVAPI_OK)
-		{
-			ulog("output id: 0x%x\n", display_output_id);
-		}
-		else
-		{
-			ulog("Failed to get display name for attached display device %d", num);
-		}
+	detachNonNvdiaDisplays();
 
-		num++;
-	}
-
-
-	ulog("unattached displays...\n");
-	NvUnAttachedDisplayHandle unattached_display_handle;
-	num = 0;
-	while (NvAPI_EnumNvidiaUnAttachedDisplayHandle(num, &unattached_display_handle) == NVAPI_OK)
-	{
-		NvAPI_ShortString display_name;
-		if(NvAPI_GetUnAttachedAssociatedDisplayName(unattached_display_handle, display_name) == NVAPI_OK)
-		{
-			ulog("%s\n", display_name);
-		}
-		else
-		{
-			ulog("Failed to get display name for unattached display device %d", num);
-		}
-
-		num++;
-	}
-
-	//ShowCurrentDisplayConfig();
-
-
-	{
-		NvAPI_Status nvStatus;
-		NvPhysicalGpuHandle nvGPUHandles[NVAPI_MAX_PHYSICAL_GPUS];
-		memset(nvGPUHandles, 0, sizeof(NvPhysicalGpuHandle));
-		NvU32 nvGpuCount = 0;
-		if ((NvAPI_EnumPhysicalGPUs(nvGPUHandles, &nvGpuCount) == NVAPI_OK) && nvGpuCount > 0) 
-		{
-			// we got some NVIDIA GPUs...
-			NV_EDID anEdidNv;
-			memset(&anEdidNv, 0, sizeof(NV_EDID));
-			anEdidNv.version = NV_EDID_VER;
-
-			for (size_t h = 0; h < nvGpuCount; h++) 
-			{
-				NvU32 displayCnt = 0;
-				nvStatus = NvAPI_GPU_GetAllDisplayIds(nvGPUHandles[h], NULL, &displayCnt);
-				if (nvStatus == NVAPI_OK)
-				{
-					ulog("%u displays for GPU %u", displayCnt, h);
-
-					NV_GPU_DISPLAYIDS* pDisplayIds = NULL;
-
-					pDisplayIds	= (NV_GPU_DISPLAYIDS*)malloc(displayCnt * sizeof(NV_GPU_DISPLAYIDS));
-					memset(pDisplayIds, 0, displayCnt * sizeof(NV_GPU_DISPLAYIDS));
-
-					for (unsigned int i = 0; i < displayCnt; ++i)
-					{
-						pDisplayIds[i].version = NV_GPU_DISPLAYIDS_VER;
-					}
-
-					nvStatus = NvAPI_GPU_GetAllDisplayIds(nvGPUHandles[h], pDisplayIds, &displayCnt);
-					if(nvStatus == NVAPI_OK)
-					{
-						for (unsigned int i = 0; i < displayCnt; ++i)
-						{
-							ulog("GPU[%u] display[0x%x]: OSVisible[%s], connected[%s], active[%s]", 
-									h, pDisplayIds[i].displayId, pDisplayIds[i].isOSVisible?"YES":"NO", pDisplayIds[i].isConnected?"YES":"NO", pDisplayIds[i].isActive?"YES":"NO");
-
-							NV_EDID loadEdid;
-							makeEdid(&loadEdid);
-							nvStatus = NvAPI_GPU_GetEDID(nvGPUHandles[h], pDisplayIds[i].displayId, &anEdidNv);
-							if (nvStatus != NVAPI_OK)
-							{
-								ulog("Failed to get EDID for display 0x%x GPU %u", pDisplayIds[i].displayId, h);
-
-								if (pDisplayIds[i].isOSVisible && !pDisplayIds[i].isConnected && !pDisplayIds[i].isActive)
-								{
-									NV_EDID loadEdid;
-									makeEdid(&loadEdid);
-									nvStatus = NvAPI_GPU_SetEDID(nvGPUHandles[h], pDisplayIds[i].displayId, &loadEdid);
-									if(nvStatus != NVAPI_OK)
-									{
-										ulog("Failed to set EDID for display 0x%x GPU %u", pDisplayIds[i].displayId, h);
-									}
-									else
-									{
-
-									}
-								}
-							}
-							else
-							{
-								ulog("Got EDID (id = %u, version = 0x%x, size = %u, offset = %u) for display 0x%x (%sactive) GPU %u\n", 
-									anEdidNv.edidId, anEdidNv.version, anEdidNv.sizeofEDID, anEdidNv.offset, pDisplayIds[i].displayId, pDisplayIds[i].isActive?"":"in", h);
-
-								for(unsigned int j = 0; j < anEdidNv.sizeofEDID; j++)
-								{
-									printf("%.2x ", anEdidNv.EDID_Data[j]&0xff);
-								}
-							}
-						}
-					}
-
-					free(pDisplayIds);
-				}
-				else
-				{
-					ulog("Failed to get number of displays for GPU %u", h);
-					continue;
-				}
-			}
-		}
-	}
-
-	bool hasAttachedDisplay = false;
-	ulog("rechecking attached displays...\n");
-	num = 0;
-	while (NvAPI_EnumNvidiaDisplayHandle(num, &display_handle) == NVAPI_OK)
-	{
-		NvAPI_ShortString display_name;
-		if (NvAPI_GetAssociatedNvidiaDisplayName(display_handle, display_name) == NVAPI_OK)
-		{
-			ulog("display: %s\t", display_name);
-		}
-		else
-		{
-			ulog("Failed to get display name for attached display device %d", num);
-		}
-
-		NvU32 display_output_id;
-		if (NvAPI_GetAssociatedDisplayOutputId(display_handle, &display_output_id) == NVAPI_OK)
-		{
-			ulog("output id: 0x%x\n", display_output_id);
-		}
-		else
-		{
-			ulog("Failed to get display name for attached display device %d", num);
-		}
-
-		hasAttachedDisplay = true;
-
-		num++;
-	}
-
-	if(hasAttachedDisplay)
-	{
-		ulog("NVIDIA display attached, detach other displays...\n");
-
-		printDebugInfo();
-
-		detachNonNvdiaDisplays();
-	}
-
+    printDebugInfo();
 
 	ulog("Display Configuration Successful!\n");
 	pfe_pause();
